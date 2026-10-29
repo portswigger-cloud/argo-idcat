@@ -109,10 +109,7 @@ repoServer:
 
 extraObjects:
   # One secret per repository: the base URL names the repository, which is how
-  # argo-idcat knows what to ask idcat for. For every repository of an owner,
-  # use a repo-creds secret (argocd.argoproj.io/secret-type: repo-creds) with
-  # url https://github.com/OWNER and base URL http://127.0.0.1:8181/OWNER; idcat
-  # then needs an [[owner-policy]] for it, since the token is owner-wide.
+  # argo-idcat knows what to ask idcat for.
   - apiVersion: v1
     kind: Secret
     metadata:

@@ -13,11 +13,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct IdcatError(pub(crate) String);
 
 pub trait TokenSource: Send + Sync + 'static {
-    /// A token for owner/repo, or an owner-wide one when repo is None.
+    /// A token for owner/repo.
     fn installation_token(
         &self,
         owner: &str,
-        repo: Option<&str>,
+        repo: &str,
     ) -> impl Future<Output = Result<String, IdcatError>> + Send;
 }
 
@@ -46,15 +46,8 @@ impl<B: BearerSource> IdcatClient<B> {
 }
 
 impl<B: BearerSource> TokenSource for IdcatClient<B> {
-    async fn installation_token(
-        &self,
-        owner: &str,
-        repo: Option<&str>,
-    ) -> Result<String, IdcatError> {
-        let target = match repo {
-            Some(repo) => format!("{owner}/{repo}"),
-            None => owner.to_string(),
-        };
+    async fn installation_token(&self, owner: &str, repo: &str) -> Result<String, IdcatError> {
+        let target = format!("{owner}/{repo}");
         let url = format!(
             "{}/installation-token/{}/{target}",
             self.endpoint, self.github_app
@@ -154,32 +147,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repo_and_owner_tokens() {
-        let (endpoint, seen) = fake_idcat(StatusCode::OK, "ghs_token\n").await;
-        let client = client(&endpoint, vec![Ok("jwt"), Ok("refreshed")]);
+    async fn repo_token() {
+        let (endpoint, seen) = fake_idcat(
+            StatusCode::OK,
+            "ghs_token
+",
+        )
+        .await;
+        let client = client(&endpoint, vec![Ok("jwt")]);
 
-        let repo_token = client
-            .installation_token("platfrom-cloud", Some("manifests"))
+        let token = client
+            .installation_token("platfrom-cloud", "manifests")
             .await
             .unwrap();
-        client
-            .installation_token("platfrom-cloud", None)
-            .await
-            .unwrap();
 
-        assert_eq!(repo_token, "ghs_token");
+        assert_eq!(token, "ghs_token");
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![
-                (
-                    "/installation-token/argocd/platfrom-cloud/manifests".to_string(),
-                    "Bearer jwt".to_string()
-                ),
-                (
-                    "/installation-token/argocd/platfrom-cloud".to_string(),
-                    "Bearer refreshed".to_string()
-                ),
-            ]
+            vec![(
+                "/installation-token/argocd/platfrom-cloud/manifests".to_string(),
+                "Bearer jwt".to_string()
+            )]
         );
     }
 
@@ -188,7 +176,7 @@ mod tests {
         let (endpoint, _) = fake_idcat(StatusCode::FORBIDDEN, "forbidden").await;
 
         let error = client(&endpoint, vec![Ok("jwt")])
-            .installation_token("o", Some("r"))
+            .installation_token("o", "r")
             .await
             .unwrap_err();
 
@@ -203,7 +191,7 @@ mod tests {
         let (endpoint, _) = fake_idcat(StatusCode::OK, "\n").await;
 
         let error = client(&endpoint, vec![Ok("jwt")])
-            .installation_token("o", Some("r"))
+            .installation_token("o", "r")
             .await
             .unwrap_err();
 
@@ -217,7 +205,7 @@ mod tests {
         drop(listener);
 
         let error = client(&endpoint, vec![Ok("jwt")])
-            .installation_token("o", Some("r"))
+            .installation_token("o", "r")
             .await
             .unwrap_err();
 
@@ -235,7 +223,7 @@ mod tests {
             &endpoint,
             vec![Err("STS GetWebIdentityToken failed: AccessDenied: no")],
         )
-        .installation_token("o", Some("r"))
+        .installation_token("o", "r")
         .await
         .unwrap_err();
 

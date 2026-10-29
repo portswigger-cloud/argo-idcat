@@ -14,8 +14,7 @@
 //! `POST /OWNER/REPO/app/installations/ID/access_tokens` and is answered with a
 //! token from idcat. The JWT argo-cd signs for the request is ignored, as is the
 //! installation ID: the private key behind them is a throwaway, and idcat
-//! decides which installation and permissions apply. A base URL of
-//! `http://127.0.0.1:8181/OWNER` asks idcat for an owner-wide token.
+//! decides which installation and permissions apply.
 
 use crate::idcat::TokenSource;
 use axum::extract::{Path, State};
@@ -39,10 +38,6 @@ pub fn token_router<T: TokenSource>(tokens: T, token_lifetime: Duration) -> Rout
             "/{owner}/{repo}/app/installations/{installation_id}/access_tokens",
             post(repo_token::<T>),
         )
-        .route(
-            "/{owner}/app/installations/{installation_id}/access_tokens",
-            post(owner_token::<T>),
-        )
         .with_state(Arc::new(AppState {
             tokens,
             token_lifetime,
@@ -60,22 +55,11 @@ async fn repo_token<T: TokenSource>(
     State(state): State<Arc<AppState<T>>>,
     Path((owner, repo, _installation_id)): Path<(String, String, u64)>,
 ) -> Response {
-    token_response(&state, &owner, Some(&repo)).await
+    token_response(&state, &owner, &repo).await
 }
 
-async fn owner_token<T: TokenSource>(
-    State(state): State<Arc<AppState<T>>>,
-    Path((owner, _installation_id)): Path<(String, u64)>,
-) -> Response {
-    token_response(&state, &owner, None).await
-}
-
-async fn token_response<T: TokenSource>(
-    state: &AppState<T>,
-    owner: &str,
-    repo: Option<&str>,
-) -> Response {
-    if !is_valid_owner(owner) || !repo.is_none_or(is_valid_repo) {
+async fn token_response<T: TokenSource>(state: &AppState<T>, owner: &str, repo: &str) -> Response {
+    if !is_valid_owner(owner) || !is_valid_repo(repo) {
         return github_error(StatusCode::NOT_FOUND, "Not Found");
     }
     match state.tokens.installation_token(owner, repo).await {
@@ -129,20 +113,16 @@ mod tests {
 
     #[derive(Default)]
     struct FakeTokens {
-        requests: Mutex<Vec<(String, Option<String>)>>,
+        requests: Mutex<Vec<(String, String)>>,
         error: Option<&'static str>,
     }
 
     impl TokenSource for Arc<FakeTokens> {
-        async fn installation_token(
-            &self,
-            owner: &str,
-            repo: Option<&str>,
-        ) -> Result<String, IdcatError> {
+        async fn installation_token(&self, owner: &str, repo: &str) -> Result<String, IdcatError> {
             self.requests
                 .lock()
                 .unwrap()
-                .push((owner.to_string(), repo.map(str::to_string)));
+                .push((owner.to_string(), repo.to_string()));
             match self.error {
                 Some(error) => Err(IdcatError(error.to_string())),
                 None => Ok("ghs_token".to_string()),
@@ -177,7 +157,7 @@ mod tests {
         token_router(tokens.clone(), Duration::from_secs(540))
     }
 
-    fn requests(tokens: &FakeTokens) -> Vec<(String, Option<String>)> {
+    fn requests(tokens: &FakeTokens) -> Vec<(String, String)> {
         tokens.requests.lock().unwrap().clone()
     }
 
@@ -200,25 +180,7 @@ mod tests {
         assert!(expires_at <= SystemTime::now() + Duration::from_secs(540));
         assert_eq!(
             requests(&tokens),
-            vec![("platfrom-cloud".to_string(), Some("manifests".to_string()))]
-        );
-    }
-
-    #[tokio::test]
-    async fn owner_token() {
-        let tokens = Arc::new(FakeTokens::default());
-
-        let (status, _) = request(
-            router(&tokens),
-            Method::POST,
-            "/platfrom-cloud/app/installations/42/access_tokens",
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(
-            requests(&tokens),
-            vec![("platfrom-cloud".to_string(), None)]
+            vec![("platfrom-cloud".to_string(), "manifests".to_string())]
         );
     }
 
@@ -227,6 +189,10 @@ mod tests {
         for (path, expected) in [
             (
                 "/-bad/manifests/app/installations/1/access_tokens",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/platfrom-cloud/app/installations/1/access_tokens",
                 StatusCode::NOT_FOUND,
             ),
             (
