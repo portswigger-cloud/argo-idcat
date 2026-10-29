@@ -32,8 +32,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tracing::info;
 
-/// The audience of the idcat role, and the only one the IAM role may request.
-const AUDIENCE: &str = "idcat";
 const SIGNING_ALGORITHM: &str = "ES384";
 /// The longest token the IAM role may request.
 const MAX_TOKEN_DURATION: Duration = Duration::from_secs(3600);
@@ -52,6 +50,9 @@ const SESSION_NAME: &str = "argo-idcat";
 
 pub struct StsIssuer {
     sts: aws_sdk_sts::Client,
+    /// What the tokens are for: idcat's host, which the central role's IAM
+    /// policy has to allow.
+    audience: String,
     provider: SharedCredentialsProvider,
     /// For error messages: the providers' own don't name it.
     token_file: PathBuf,
@@ -114,6 +115,7 @@ impl StsIssuer {
                     .timeout_config(timeout)
                     .build(),
             ),
+            audience: config.audience().to_string(),
             provider: SharedCredentialsProvider::new(central_role),
             token_file: config.web_identity_token_file.clone(),
         }
@@ -144,7 +146,7 @@ impl TokenIssuer for StsIssuer {
         let output = self
             .sts
             .get_web_identity_token()
-            .audience(AUDIENCE)
+            .audience(&self.audience)
             .signing_algorithm(SIGNING_ALGORITHM)
             .duration_seconds(duration.as_secs() as i32)
             .customize()
@@ -528,7 +530,7 @@ mod tests {
             params(&[
                 ("Action", "GetWebIdentityToken"),
                 ("Version", "2011-06-15"),
-                ("Audience.member.1", "idcat"),
+                ("Audience.member.1", "idcat.example.com"),
                 ("SigningAlgorithm", "ES384"),
             ])
         );
