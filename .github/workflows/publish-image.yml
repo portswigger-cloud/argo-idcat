@@ -1,0 +1,184 @@
+name: Publish Docker image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The vanity alias of the same registry as public.ecr.aws/q3z6g1h3.
+  IMAGE_REGISTRY: public.ecr.aws/portswigger-platform
+  # The repository within it, which is also what the ECR Public API takes: a
+  # describe-images call names the repository of the caller's own registry, so it
+  # does not carry the alias.
+  IMAGE_REPOSITORY: argo-idcat
+  AWS_ROLE: arn:aws:iam::436027055282:role/crossplane/argo-idcat-ecr-publish
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_version: ${{ steps.image-version.outputs.image_version }}
+      exists: ${{ steps.published.outputs.exists }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Install bktools
+        run: uv venv && uv pip install bktools --extra-index-url https://repo.noa.re
+
+      - name: Compute Docker image tag
+        id: image-version
+        run: |
+          # A hash of the build context, so that a tag names an image built from
+          # exactly this source.
+          image_version="$(uv run bktools-image-version-hash)"
+          echo "image_version=${image_version}" >> "$GITHUB_OUTPUT"
+          # Written to the job summary so that the version a run produced is on the
+          # run's own page, rather than inside the log of whichever step computed it.
+          {
+            echo "## argo-idcat ${image_version}"
+            echo
+            echo "- **Image:** \`${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}:${image_version}\`"
+            echo "- **Commit:** \`${GITHUB_SHA}\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          aws-region: us-east-1
+
+      - name: Check whether the image is already published
+        id: published
+        run: |
+          # The tag is a hash of the build context, so a tag already in the registry
+          # names an image built from exactly this source and there is nothing to
+          # gain from building it again.
+          #
+          # A check that fails for any other reason than a missing image reports the
+          # image as unpublished, so a registry that cannot be reached, or a role
+          # without ecr-public:DescribeImages, costs a rebuild rather than skipping a
+          # push that never happened. Why it failed is logged either way, so that
+          # does not look like an image that was simply absent.
+          if error="$(aws ecr-public describe-images \
+              --region us-east-1 \
+              --repository-name "${IMAGE_REPOSITORY}" \
+              --image-ids "imageTag=${IMAGE_VERSION}" 2>&1)"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${IMAGE_VERSION} is already published; skipping the build"
+            echo "Already published, so the build was skipped." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$error" == *ImageNotFoundException* ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "${IMAGE_VERSION} is not published yet; building"
+            echo "Not published yet, so this run builds and pushes it." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "could not check whether ${IMAGE_VERSION} is published: ${error}"
+            {
+              echo "Could not check whether it was already published, so this run"
+              echo "builds and pushes it regardless:"
+              echo
+              echo '```'
+              echo "${error}"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+        env:
+          IMAGE_VERSION: ${{ steps.image-version.outputs.image_version }}
+
+  build:
+    needs: version
+    if: needs.version.outputs.exists != 'true'
+
+    # Each platform builds on a runner of its own architecture: compiling Rust
+    # under QEMU emulation is far slower than the build itself.
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            output_name: digest_amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            output_name: digest_arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    outputs:
+      digest_amd64: ${{ steps.export.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.export.outputs.digest_arm64 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR Public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_REPOSITORY }},push-by-digest=true,name-canonical=true,push=true,compression=zstd,force-compression=true
+
+      - name: Export digest
+        id: export
+        run: |
+          echo "${{ matrix.output_name }}=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  merge:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR Public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create and push manifest list
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}:${{ needs.version.outputs.image_version }}" \
+            "${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}@${{ needs.build.outputs.digest_amd64 }}" \
+            "${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}@${{ needs.build.outputs.digest_arm64 }}"
