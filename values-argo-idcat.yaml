@@ -1,0 +1,134 @@
+# argo-cd helm chart values that let the repo-server read private GitHub
+# repositories with installation tokens from idcat, via the argo-idcat sidecar.
+#
+# argo-cd is given GitHub App credentials for the repository whose enterprise
+# base URL points at argo-idcat on loopback. argo-idcat answers argo-cd's token
+# request with a token from idcat, which it gets by presenting an AWS STS web
+# identity token (GetWebIdentityToken) for the central IAM role
+# idcat-argocd-repo-server. Both go-git (HEAD/branch/tag resolution) and the
+# git CLI (fetch) use the installation token.
+#
+# argo-idcat gets the central role's credentials itself, from a projected
+# service account token (audience sts.amazonaws.com) mounted into the sidecar
+# only: it exchanges the token for a source role in the cluster's own account
+# (AssumeRoleWithWebIdentity), and with that role's credentials assumes the
+# central role in the management account (AssumeRole). The service account is
+# not annotated with a role, so EKS's IRSA webhook leaves argo-cd's own
+# containers alone; the AWS variables are set on the sidecar below.
+#
+# Before applying, in the cluster's account:
+#   - the source role /with-iam/argocd-repo-server-idcat-<cluster>, trusting
+#     the cluster's OIDC provider with sts:AssumeRoleWithWebIdentity for
+#     sub system:serviceaccount:argo:argocd-repo-server and
+#     aud sts.amazonaws.com, and allowed sts:AssumeRole on
+#     arn:aws:iam::132827254700:role/crossplane/idcat-argocd-repo-server.
+#     clusterspinner's cluster module creates it. It has to be under
+#     /with-iam/: the cloud OU's SCP denies sts:AssumeRole on roles with other
+#     paths. The central role admits any argocd-repo-server-idcat-* there.
+# and:
+#   - set the image, IDCAT_ENDPOINT, GITHUB_APP, AWS_REGION and AWS_ROLE_ARN
+#     below (CHANGE ME)
+#   - remove any other argo-cd repository secret (e.g. a deploy key) for the
+#     same repository URL, and reference it as https://github.com/OWNER/REPO
+# Nothing per cluster is needed in idcat or in the management account: every
+# cluster reaches the same central role, and so the same idcat [[role]] (see
+# README.md), which needs contents: read on the repositories below.
+
+repoServer:
+  initContainers:
+    # Native sidecar (restartPolicy: Always): the startup probe has to pass
+    # before the repo-server starts, so the token endpoint is there from its
+    # first request.
+    - name: argo-idcat
+      image: public.ecr.aws/portswigger-platform/argo-idcat:dev  # CHANGE ME
+      restartPolicy: Always
+      env:
+        - name: IDCAT_ENDPOINT
+          value: https://idcat.example.com  # CHANGE ME
+        - name: GITHUB_APP
+          value: argocd  # CHANGE ME
+        # GetWebIdentityToken is only served by regional STS endpoints; all
+        # three STS requests go to this region's.
+        - name: AWS_REGION
+          value: eu-west-1  # CHANGE ME
+        # The source role, in the cluster's own account.
+        - name: AWS_ROLE_ARN
+          value: arn:aws:iam::111111111111:role/with-iam/argocd-repo-server-idcat-CLUSTER  # CHANGE ME
+        - name: AWS_WEB_IDENTITY_TOKEN_FILE
+          value: /var/run/secrets/sts.amazonaws.com/serviceaccount/token
+        # The central role, the same for every cluster.
+        - name: IDCAT_ROLE_ARN
+          value: arn:aws:iam::132827254700:role/crossplane/idcat-argocd-repo-server
+      volumeMounts:
+        - name: argo-idcat-aws-token
+          mountPath: /var/run/secrets/sts.amazonaws.com/serviceaccount
+          readOnly: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop:
+            - ALL
+      # The token endpoint stays on loopback; /healthz has a listener of its
+      # own on all interfaces so that kubelet can reach it.
+      ports:
+        - name: idcat-health
+          containerPort: 8182
+      startupProbe:
+        httpGet:
+          path: /healthz
+          port: idcat-health
+        periodSeconds: 1
+        failureThreshold: 30
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: idcat-health
+        periodSeconds: 30
+      resources:
+        requests:
+          cpu: 5m
+          memory: 8Mi
+        limits:
+          memory: 32Mi
+  volumes:
+    # Mounted into the argo-idcat sidecar only. kubelet rotates the token
+    # before it expires, and argo-idcat reads the file each time it fetches
+    # credentials.
+    - name: argo-idcat-aws-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              audience: sts.amazonaws.com
+              expirationSeconds: 3600
+              path: token
+
+extraObjects:
+  # One secret per repository: the base URL names the repository, which is how
+  # argo-idcat knows what to ask idcat for. For every repository of an owner,
+  # use a repo-creds secret (argocd.argoproj.io/secret-type: repo-creds) with
+  # url https://github.com/OWNER and base URL http://127.0.0.1:8181/OWNER; idcat
+  # then needs an [[owner-policy]] for it, since the token is owner-wide.
+  - apiVersion: v1
+    kind: Secret
+    metadata:
+      name: repo-platfrom-cloud-manifests
+      labels:
+        argocd.argoproj.io/secret-type: repository
+    stringData:
+      type: git
+      url: https://github.com/platfrom-cloud/manifests
+      githubAppEnterpriseBaseUrl: http://127.0.0.1:8181/platfrom-cloud/manifests
+      # argo-idcat ignores both IDs; idcat picks the installation.
+      githubAppID: "1"
+      githubAppInstallationID: "1"
+      # Not a secret. argo-cd signs a JWT with this key for its token request,
+      # and argo-idcat ignores the JWT; the key only has to parse. Generate
+      # a throwaway one, not used for anything else, with
+      # `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048` (CHANGE ME).
+      githubAppPrivateKey: |
+        <throwaway RSA private key in PEM form>
