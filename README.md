@@ -34,33 +34,32 @@ Because argo-cd treats this as ordinary GitHub App credentials, both the
 in-process go-git client (used to resolve `HEAD`, branches and tags) and the git
 CLI (used to fetch) get the token.
 
-A base URL of `http://127.0.0.1:8181/OWNER`, without the repository, asks idcat
-for an owner-wide token instead. That suits a `repo-creds` credential template
-covering a whole organisation, provided idcat has an `[[owner-policy]]` for it.
-
 ## Identity
+
+The idea with this setup is that idcat can be set up to trust a single JWT
+issuer for many argo-cd instances running in different clusters. This is
+accomplished by having the sidecar assume a role in the local cluster using the
+IAM Roles for ServiceAccounts (IRSA) mechanism, and then having argo-idcat
+assume a single central IAM role, which in turn is used to obtain the JWT.
 
 The bearer token argo-idcat presents to idcat is a JWT from AWS STS
 [`GetWebIdentityToken`](https://docs.aws.amazon.com/STS/latest/APIReference/API_GetWebIdentityToken.html)
 (IAM outbound identity federation), requested with audience `idcat`, signing
-algorithm `ES384` and a lifetime of just under an hour. Its `iss` is the management
-account's issuer and its `sub` the ARN of the role that asked for it.
+algorithm `ES384` and a lifetime of just under an hour. Its `iss` is the issuer
+of the AWS account that has outbound identity federation enabled, and its `sub`
+the ARN of the role that asked for it.
 
-That role is one central role, `/crossplane/idcat-argocd-repo-server` in the
-management account, created by crossplane from the management section of
-portswigger-cloud/system, and shared by the repo-servers of every cluster.
+That role is the central role, shared by the repo-servers of every cluster.
 argo-idcat reaches it in two steps, both against the region's STS endpoint:
 
 1. It reads a projected service account token with audience
    `sts.amazonaws.com` from `AWS_WEB_IDENTITY_TOKEN_FILE`, and exchanges it
    with `AssumeRoleWithWebIdentity` for credentials of a source role in the
-   cluster's own account, `/with-iam/argocd-repo-server-idcat-<cluster>`
-   (`AWS_ROLE_ARN`), created by clusterspinner's cluster module.
-   This is IRSA, done by argo-idcat rather than by EKS's webhook: the source
-   role's trust policy trusts the cluster's OIDC provider, for
-   `system:serviceaccount:argo:argocd-repo-server` and audience
-   `sts.amazonaws.com` only. The role has to be under `/with-iam/`, as the
-   cloud OU's SCP denies `sts:AssumeRole` on roles with other paths.
+   cluster's own account (`AWS_ROLE_ARN`). This is IRSA, done by argo-idcat
+   rather than by EKS's webhook: the source role's trust policy trusts the
+   cluster's OIDC provider, for the repo-server's service account (e.g.
+   `system:serviceaccount:argo:argocd-repo-server`) and audience
+   `sts.amazonaws.com` only.
 2. With the source role's credentials, which allow `sts:AssumeRole` on the
    central role, it calls `AssumeRole` for the central role (`IDCAT_ROLE_ARN`),
    and signs `GetWebIdentityToken` with the result.
@@ -70,35 +69,36 @@ these providers only, not the SDK's default chain, so that it can't fall back
 to the node's role. It reads the token file each time it fetches credentials,
 so it picks up the token kubelet rotates.
 
-The central role's trust policy allows the source role by the organisation ID
-and the source role's exact name and path, in any account of the organisation.
-argo-idcat passes no session tags, so nothing in that check says which cluster
-or service account is asking: the source role's own trust policy is what pins
-it to the one service account in the one cluster.
+The central role's trust policy allows the source roles, for instance by
+organisation ID and the roles' name pattern. argo-idcat passes no session
+tags, so nothing in that check says which cluster or service account is
+asking: each source role's own trust policy is what pins it to the one service
+account in its cluster.
 
 So idcat needs a single role, whichever cluster asks, and adding a cluster
-needs nothing in idcat or in the management account:
+needs nothing in idcat or in the account that hosts the central role:
 
 ```toml
 [[role]]
 name = "argocd-repo-server"
 audience = "idcat"
-# aws iam get-outbound-web-identity-federation-info, in the management account
+# aws iam get-outbound-web-identity-federation-info, in the account hosting
+# the central role
 issuer = "https://<id>.tokens.sts.global.api.aws"
 # idcat's validator accepts only RS256 and ES256 unless told otherwise.
 algorithms = ["ES384"]
-claims = { sub = "arn:aws:iam::<management account>:role/crossplane/idcat-argocd-repo-server" }
+claims = { sub = "arn:aws:iam::<account>:role/<path>/<central role>" }
 ```
 
 AWS documents `sub` as "the ARN of the IAM principal that requested the token",
 and its example is a role ARN without a path. Whether the ARN of a role with a
-path, such as `/crossplane/`, keeps the path in `sub` is not documented;
-decode a token to check before relying on the value above.
+path keeps the path in `sub` is not documented; decode a token to check before
+relying on the value above.
 
 The central role may only request tokens with audience `idcat` and
 `DurationSeconds` of at most 3600, which its IAM policy enforces with the
 `sts:IdentityTokenAudience` and `sts:DurationSeconds` condition keys, and
-outbound identity federation has to be enabled in the management account
+outbound identity federation has to be enabled in its account
 (`aws iam enable-outbound-web-identity-federation`).
 
 argo-idcat keeps a token until half of its life, as given by the expiration STS
