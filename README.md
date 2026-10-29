@@ -44,7 +44,8 @@ assume a single central IAM role, which in turn is used to obtain the JWT.
 
 The bearer token argo-idcat presents to idcat is a JWT from AWS STS
 [`GetWebIdentityToken`](https://docs.aws.amazon.com/STS/latest/APIReference/API_GetWebIdentityToken.html)
-(IAM outbound identity federation), requested with audience `idcat`, signing
+(IAM outbound identity federation), requested with idcat's host as audience
+(`IDCAT_ENDPOINT` without its scheme, e.g. `idcat.example.com`), signing
 algorithm `ES384` and a lifetime of just under an hour. Its `iss` is the issuer
 of the AWS account that has outbound identity federation enabled, and its `sub`
 the ARN of the role that asked for it.
@@ -81,7 +82,7 @@ needs nothing in idcat or in the account that hosts the central role:
 ```toml
 [[role]]
 name = "argocd-repo-server"
-audience = "idcat"
+audience = "idcat.example.com"  # the host of IDCAT_ENDPOINT
 # aws iam get-outbound-web-identity-federation-info, in the account hosting
 # the central role
 issuer = "https://<id>.tokens.sts.global.api.aws"
@@ -95,7 +96,7 @@ and its example is a role ARN without a path. Whether the ARN of a role with a
 path keeps the path in `sub` is not documented; decode a token to check before
 relying on the value above.
 
-The central role may only request tokens with audience `idcat` and
+The central role may only request tokens with idcat's host as audience and
 `DurationSeconds` of at most 3600, which its IAM policy enforces with the
 `sts:IdentityTokenAudience` and `sts:DurationSeconds` condition keys, and
 outbound identity federation has to be enabled in its account

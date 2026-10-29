@@ -35,6 +35,16 @@ pub struct Config {
 }
 
 impl Config {
+    /// The audience of the tokens idcat is sent: its endpoint without the
+    /// scheme, so a token minted for one idcat is of no use at another.
+    pub fn audience(&self) -> &str {
+        let endpoint = self.idcat_endpoint.as_str();
+        endpoint
+            .strip_prefix("https://")
+            .or_else(|| endpoint.strip_prefix("http://"))
+            .unwrap_or(endpoint)
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -122,6 +132,21 @@ mod tests {
                     "arn:aws:iam::132827254700:role/crossplane/idcat-argocd-repo-server".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn audience_is_the_endpoint_without_its_scheme() {
+        for (endpoint, audience) in [
+            ("https://idcat.example.com/", "idcat.example.com"),
+            ("https://idcat.example.com:8443", "idcat.example.com:8443"),
+            ("http://localhost:8080", "localhost:8080"),
+        ] {
+            let mut vars = without(&["IDCAT_ENDPOINT"]);
+            vars.push(("IDCAT_ENDPOINT", endpoint));
+            let config = Config::from_lookup(lookup(&vars)).unwrap();
+
+            assert_eq!(config.audience(), audience);
+        }
     }
 
     #[test]
