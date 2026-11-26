@@ -40,15 +40,15 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install bktools
-        run: uv venv && uv pip install bktools --extra-index-url https://repo.noa.re
+      - name: Create venv
+        run: uv venv
 
       - name: Compute Docker image tag
         id: image-version
         run: |
           # A hash of the build context, so that a tag names an image built from
           # exactly this source.
-          image_version="$(uv run bktools-image-version-hash)"
+          image_version="$(uvx --from "git+https://github.com/portswigger-cloud/container-image-hash@07d00c5c6556677e488a72eecb42600e156b974a" container-image-hash)"
           echo "image_version=${image_version}" >> "$GITHUB_OUTPUT"
           # Written to the job summary so that the version a run produced is on the
           # run's own page, rather than inside the log of whichever step computed it.
